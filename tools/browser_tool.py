@@ -17,8 +17,7 @@ Features:
   ``agent-browser install`` (downloads Chromium) or
   ``agent-browser install --with-deps`` (also installs system libraries for
   Debian/Ubuntu/Docker).
-- **Cloud mode**: Browserbase cloud execution with stealth features, proxies,
-  and CAPTCHA solving.  Activated when BROWSERBASE_API_KEY is set.
+- **Cloud mode**: Browserbase or Browser Use cloud execution when configured.
 - Session isolation per task ID
 - Text-based page snapshots using accessibility tree
 - Element interaction via ref selectors (@e1, @e2, etc.)
@@ -26,8 +25,9 @@ Features:
 - Automatic cleanup of browser sessions
 
 Environment Variables:
-- BROWSERBASE_API_KEY: API key for Browserbase (enables cloud mode)
-- BROWSERBASE_PROJECT_ID: Project ID for Browserbase (required for cloud mode)
+- BROWSERBASE_API_KEY: API key for direct Browserbase cloud mode
+- BROWSERBASE_PROJECT_ID: Project ID for direct Browserbase cloud mode
+- BROWSER_USE_API_KEY: API key for direct Browser Use cloud mode
 - BROWSERBASE_PROXIES: Enable/disable residential proxies (default: "true")
 - BROWSERBASE_ADVANCED_STEALTH: Enable advanced stealth mode with custom Chromium,
   requires Scale Plan (default: "false")
@@ -613,7 +613,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_close",
-        "description": "Close the browser session and release resources. Call this when done with browser tasks to free up Browserbase session quota.",
+        "description": "Close the browser session and release resources. Call this when done with browser tasks to free up cloud browser session quota.",
         "parameters": {
             "type": "object",
             "properties": {},
@@ -740,6 +740,11 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
             session_info = _create_local_session(task_id)
         else:
             session_info = provider.create_session(task_id)
+            if session_info.get("cdp_url"):
+                # Some cloud providers (including Browser-Use v3) return an HTTP
+                # CDP discovery URL instead of a raw websocket endpoint.
+                session_info = dict(session_info)
+                session_info["cdp_url"] = _resolve_cdp_override(str(session_info["cdp_url"]))
     
     with _cleanup_lock:
         # Double-check: another thread may have created a session while we

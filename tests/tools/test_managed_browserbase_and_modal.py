@@ -113,16 +113,15 @@ def _install_fake_tools_package():
     sys.modules["tools.environments.managed_modal"] = types.SimpleNamespace(ManagedModalEnvironment=_DummyEnvironment)
 
 
-def test_browserbase_explicit_local_mode_stays_local_even_when_managed_gateway_is_ready(tmp_path):
+def test_browser_use_explicit_local_mode_stays_local_even_when_managed_gateway_is_ready(tmp_path):
     _install_fake_tools_package()
     (tmp_path / "config.yaml").write_text("browser:\n  cloud_provider: local\n", encoding="utf-8")
     env = os.environ.copy()
-    env.pop("BROWSERBASE_API_KEY", None)
-    env.pop("BROWSERBASE_PROJECT_ID", None)
+    env.pop("BROWSER_USE_API_KEY", None)
     env.update({
         "HERMES_HOME": str(tmp_path),
         "TOOL_GATEWAY_USER_TOKEN": "nous-token",
-        "BROWSERBASE_GATEWAY_URL": "http://127.0.0.1:3009",
+        "BROWSER_USE_GATEWAY_URL": "http://127.0.0.1:3009",
     })
 
     with patch.dict(os.environ, env, clear=True):
@@ -133,6 +132,26 @@ def test_browserbase_explicit_local_mode_stays_local_even_when_managed_gateway_i
 
     assert local_mode is True
     assert provider is None
+
+
+def test_browserbase_does_not_use_gateway_only_configuration():
+    _install_fake_tools_package()
+    env = os.environ.copy()
+    env.pop("BROWSERBASE_API_KEY", None)
+    env.pop("BROWSERBASE_PROJECT_ID", None)
+    env.update({
+        "TOOL_GATEWAY_USER_TOKEN": "nous-token",
+        "BROWSERBASE_GATEWAY_URL": "http://127.0.0.1:3009",
+    })
+
+    with patch.dict(os.environ, env, clear=True):
+        browserbase_module = _load_tool_module(
+            "tools.browser_providers.browserbase",
+            "browser_providers/browserbase.py",
+        )
+        provider = browserbase_module.BrowserbaseProvider()
+
+    assert provider.is_configured() is False
 
 
 def test_browser_use_managed_gateway_adds_idempotency_key_and_persists_external_call_id():
@@ -169,6 +188,9 @@ def test_browser_use_managed_gateway_adds_idempotency_key_and_persists_external_
     sent_headers = post.call_args.kwargs["headers"]
     assert sent_headers["X-Browser-Use-API-Key"] == "nous-token"
     assert sent_headers["X-Idempotency-Key"].startswith("browser-use-session-create:")
+    sent_payload = post.call_args.kwargs["json"]
+    assert sent_payload["timeout"] == 5
+    assert sent_payload["proxyCountryCode"] == "us"
     assert session["external_call_id"] == "call-browser-use-1"
 
 

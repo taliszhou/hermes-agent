@@ -17,6 +17,8 @@ _pending_create_keys: Dict[str, str] = {}
 _pending_create_keys_lock = threading.Lock()
 
 _BASE_URL = "https://api.browser-use.com/api/v3"
+_DEFAULT_MANAGED_TIMEOUT_MINUTES = 5
+_DEFAULT_MANAGED_PROXY_COUNTRY_CODE = "us"
 
 
 def _get_or_create_pending_create_key(task_id: str) -> str:
@@ -123,10 +125,22 @@ class BrowserUseProvider(CloudBrowserProvider):
         if managed_mode:
             headers["X-Idempotency-Key"] = _get_or_create_pending_create_key(task_id)
 
+        # Keep gateway-backed sessions short so billing authorization does not
+        # default to a long Browser-Use timeout when Hermes only needs a task-
+        # scoped ephemeral browser.
+        payload = (
+            {
+                "timeout": _DEFAULT_MANAGED_TIMEOUT_MINUTES,
+                "proxyCountryCode": _DEFAULT_MANAGED_PROXY_COUNTRY_CODE,
+            }
+            if managed_mode
+            else {}
+        )
+
         response = requests.post(
             f"{config['base_url']}/browsers",
             headers=headers,
-            json={},
+            json=payload,
             timeout=30,
         )
 
