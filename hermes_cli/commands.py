@@ -107,6 +107,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_config_gate="display.tool_progress_command"),
     CommandDef("yolo", "Toggle YOLO mode (skip all dangerous command approvals)",
                "Configuration"),
+    CommandDef("local", "Toggle local inference mode (reduced concurrency, higher timeouts)",
+               "Configuration"),
     CommandDef("reasoning", "Manage reasoning effort and display", "Configuration",
                args_hint="[level|show|hide]",
                subcommands=("none", "minimal", "low", "medium", "high", "xhigh", "show", "hide", "on", "off")),

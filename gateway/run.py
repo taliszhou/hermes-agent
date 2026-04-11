@@ -2629,6 +2629,9 @@ class GatewayRunner:
         if canonical == "yolo":
             return await self._handle_yolo_command(event)
 
+        if canonical == "local":
+            return await self._handle_local_command(event)
+
         if canonical == "model":
             return await self._handle_model_command(event)
 
@@ -5647,6 +5650,20 @@ class GatewayRunner:
         else:
             enable_session_yolo(session_key)
             return "⚡ YOLO mode **ON** for this session — all commands auto-approved. Use with caution."
+
+    async def _handle_local_command(self, event: MessageEvent) -> str:
+        """Handle /local — toggle local inference throttle for this session."""
+        import os
+        from agent.local_throttle import is_local_mode, reconfigure
+
+        if is_local_mode():
+            os.environ["HERMES_LOCAL_MODE"] = "0"
+            reconfigure()
+            return "Local inference mode **OFF** — full concurrency restored."
+        else:
+            os.environ["HERMES_LOCAL_MODE"] = "1"
+            reconfigure()
+            return "Local inference mode **ON** — throttled concurrency, higher timeouts."
 
     async def _handle_verbose_command(self, event: MessageEvent) -> str:
         """Handle /verbose command — cycle tool progress display mode.

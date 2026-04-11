@@ -738,6 +738,10 @@ def cmd_chat(args):
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
 
+    # --local: enable local LLM mode (reduced concurrency, higher timeouts)
+    if getattr(args, "local", False):
+        os.environ["HERMES_LOCAL_MODE"] = "1"
+
     # --source: tag session source for filtering (e.g. 'tool' for third-party integrations)
     if getattr(args, "source", None):
         os.environ["HERMES_SESSION_SOURCE"] = args.source
@@ -4434,6 +4438,12 @@ For more help on a command:
         help="Bypass all dangerous command approval prompts (use at your own risk)"
     )
     parser.add_argument(
+        "--local",
+        action="store_true",
+        default=False,
+        help="Enable local LLM mode (reduced concurrency, higher timeouts, fewer retries)"
+    )
+    parser.add_argument(
         "--pass-session-id",
         action="store_true",
         default=False,
@@ -4527,6 +4537,12 @@ For more help on a command:
         action="store_true",
         default=argparse.SUPPRESS,
         help="Bypass all dangerous command approval prompts (use at your own risk)"
+    )
+    chat_parser.add_argument(
+        "--local",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Enable local LLM mode (reduced concurrency, higher timeouts, fewer retries)"
     )
     chat_parser.add_argument(
         "--pass-session-id",
