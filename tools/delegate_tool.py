@@ -57,9 +57,20 @@ def _get_max_concurrent_children() -> int:
     """Read delegation.max_concurrent_children from config, falling back to
     DELEGATION_MAX_CONCURRENT_CHILDREN env var, then the default (3).
 
+    When local inference mode is active, the local_inference.max_concurrent_children
+    value takes precedence to prevent request pile-up on slow local backends.
+
     Uses the same ``_load_config()`` path that the rest of ``delegate_task``
     uses, keeping config priority consistent (config.yaml > env > default).
     """
+    # Local inference override — reduce subagent concurrency for slow backends
+    try:
+        from agent.local_throttle import is_local_mode, get_config as _lt_get_config
+        if is_local_mode():
+            return int(_lt_get_config().get("max_concurrent_children", 1))
+    except Exception:
+        pass
+
     cfg = _load_config()
     val = cfg.get("max_concurrent_children")
     if val is not None:

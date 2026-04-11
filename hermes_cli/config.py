@@ -625,6 +625,19 @@ DEFAULT_CONFIG = {
     # Honcho AI-native memory -- reads ~/.honcho/config.json as single source of truth.
     # This section is only needed for hermes-specific overrides; everything else
     # (apiKey, workspace, peerName, sessions, enabled) comes from the global config.
+    # Local inference throttling — reduces concurrency, increases timeouts,
+    # and defers non-critical auxiliary tasks when using a local LLM server
+    # (ollama, vllm, lmstudio, llama.cpp, etc.).
+    "local_inference": {
+        "enabled": "auto",              # "auto" | true | false
+        "max_concurrent_requests": 1,   # global semaphore limit for LLM calls
+        "max_tool_workers": 2,          # concurrent tool-execution threads (normal: 8)
+        "max_concurrent_children": 1,   # concurrent subagents (normal: 3)
+        "stream_retries": 0,            # streaming retry attempts (normal: 2)
+        "timeout_multiplier": 3.0,      # multiply all API/auxiliary timeouts
+        "defer_compression": True,      # skip context compression to avoid extra LLM calls
+    },
+
     "honcho": {},
 
     # IANA timezone (e.g. "Asia/Kolkata", "America/New_York").

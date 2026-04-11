@@ -333,6 +333,16 @@ class ContextCompressor(ContextEngine):
         the middle turns without a summary rather than inject a useless
         placeholder.
         """
+        # In local inference mode, skip the LLM summarization call to avoid
+        # competing with the main agent loop for the single inference slot.
+        try:
+            from agent.local_throttle import is_local_mode, get_config as _lt_get_config
+            if is_local_mode() and _lt_get_config().get("defer_compression", True):
+                logger.info("Local inference mode: deferring context compression summary")
+                return None
+        except Exception:
+            pass
+
         now = time.monotonic()
         if now < self._summary_failure_cooldown_until:
             logger.debug(

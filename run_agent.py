@@ -1469,6 +1469,11 @@ class AIAgent:
         self._compression_warning = None
         self._check_compression_model_feasibility()
 
+        # Initialise local-inference throttle (idempotent — shared across
+        # parent and child agents in the same process).
+        from agent.local_throttle import configure as _configure_local_throttle
+        _configure_local_throttle()
+
         # Snapshot primary runtime for per-turn restoration.  When fallback
         # activates during a turn, the next turn restores these values so the
         # preferred model gets a fresh attempt each time.  Uses a single dict
@@ -1660,6 +1665,12 @@ class AIAgent:
         # ── Reset fallback state ──
         self._fallback_activated = False
         self._fallback_index = 0
+
+        # Re-evaluate local-inference throttle for the new endpoint.
+        # Switching from cloud → local activates the semaphore; local → cloud
+        # deactivates it — all transparently.
+        from agent.local_throttle import reconfigure as _lt_reconfigure
+        _lt_reconfigure(base_url=self.base_url, provider=new_provider)
 
         logging.info(
             "Model switched in-place: %s (%s) -> %s (%s)",
@@ -4780,25 +4791,27 @@ class AIAgent:
         request_client_holder = {"client": None}
 
         def _call():
-            try:
-                if self.api_mode == "codex_responses":
-                    request_client_holder["client"] = self._create_request_openai_client(reason="codex_stream_request")
-                    result["response"] = self._run_codex_stream(
-                        api_kwargs,
-                        client=request_client_holder["client"],
-                        on_first_delta=getattr(self, "_codex_on_first_delta", None),
-                    )
-                elif self.api_mode == "anthropic_messages":
-                    result["response"] = self._anthropic_messages_create(api_kwargs)
-                else:
-                    request_client_holder["client"] = self._create_request_openai_client(reason="chat_completion_request")
-                    result["response"] = request_client_holder["client"].chat.completions.create(**api_kwargs)
-            except Exception as e:
-                result["error"] = e
-            finally:
-                request_client = request_client_holder.get("client")
-                if request_client is not None:
-                    self._close_request_openai_client(request_client, reason="request_complete")
+            from agent.local_throttle import throttle as _lt_throttle
+            with _lt_throttle():
+                try:
+                    if self.api_mode == "codex_responses":
+                        request_client_holder["client"] = self._create_request_openai_client(reason="codex_stream_request")
+                        result["response"] = self._run_codex_stream(
+                            api_kwargs,
+                            client=request_client_holder["client"],
+                            on_first_delta=getattr(self, "_codex_on_first_delta", None),
+                        )
+                    elif self.api_mode == "anthropic_messages":
+                        result["response"] = self._anthropic_messages_create(api_kwargs)
+                    else:
+                        request_client_holder["client"] = self._create_request_openai_client(reason="chat_completion_request")
+                        result["response"] = request_client_holder["client"].chat.completions.create(**api_kwargs)
+                except Exception as e:
+                    result["error"] = e
+                finally:
+                    request_client = request_client_holder.get("client")
+                    if request_client is not None:
+                        self._close_request_openai_client(request_client, reason="request_complete")
 
         # ── Stale-call timeout (mirrors streaming stale detector) ────────
         # Non-streaming calls return nothing until the full response is
@@ -5049,8 +5062,9 @@ class AIAgent:
         def _call_chat_completions():
             """Stream a chat completions response."""
             import httpx as _httpx
-            _base_timeout = float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
-            _stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 120.0))
+            from agent.local_throttle import get_timeout as _lt_get_timeout
+            _base_timeout = _lt_get_timeout(float(os.getenv("HERMES_API_TIMEOUT", 1800.0)))
+            _stream_read_timeout = _lt_get_timeout(float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 120.0)))
             # Local providers (Ollama, llama.cpp, vLLM) can take minutes for
             # prefill on large contexts before producing the first token.
             # Auto-increase the httpx read timeout unless the user explicitly
@@ -5315,17 +5329,19 @@ class AIAgent:
 
         def _call():
             import httpx as _httpx
+            from agent.local_throttle import throttle as _lt_throttle, get_stream_retries as _lt_get_stream_retries
 
-            _max_stream_retries = int(os.getenv("HERMES_STREAM_RETRIES", 2))
+            _max_stream_retries = _lt_get_stream_retries()
 
             try:
                 for _stream_attempt in range(_max_stream_retries + 1):
                     try:
-                        if self.api_mode == "anthropic_messages":
-                            self._try_refresh_anthropic_client_credentials()
-                            result["response"] = _call_anthropic()
-                        else:
-                            result["response"] = _call_chat_completions()
+                        with _lt_throttle():
+                            if self.api_mode == "anthropic_messages":
+                                self._try_refresh_anthropic_client_credentials()
+                                result["response"] = _call_anthropic()
+                            else:
+                                result["response"] = _call_chat_completions()
                         return  # success
                     except Exception as e:
                         if deltas_were_sent["yes"]:
@@ -7093,7 +7109,8 @@ class AIAgent:
             spinner.start()
 
         try:
-            max_workers = min(num_tools, _MAX_TOOL_WORKERS)
+            from agent.local_throttle import get_tool_workers as _lt_get_tool_workers
+            max_workers = min(num_tools, _lt_get_tool_workers())
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = []
                 for i, (tc, name, args) in enumerate(parsed_calls):
@@ -9346,6 +9363,12 @@ class AIAgent:
                         if parsed_limit and parsed_limit < old_ctx:
                             new_ctx = parsed_limit
                             self._vprint(f"{self.log_prefix}⚠️  Context limit detected from API: {new_ctx:,} tokens (was {old_ctx:,})", force=True)
+                            # IMMEDIATELY cache the detected limit, even if subsequent
+                            # retries fail. This ensures the limit is persisted for future
+                            # requests. Only cache limits parsed from error messages (real values).
+                            from agent.model_metadata import save_context_length
+                            save_context_length(self.model, self.base_url, new_ctx)
+                            self._safe_print(f"{self.log_prefix}💾 Cached context length: {new_ctx:,} tokens for {self.model}")
                         else:
                             # Step down to the next probe tier
                             new_ctx = get_next_probe_tier(old_ctx)

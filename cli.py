@@ -5447,6 +5447,8 @@ class HermesCLI:
             self._toggle_verbose()
         elif canonical == "yolo":
             self._toggle_yolo()
+        elif canonical == "local":
+            self._toggle_local_mode()
         elif canonical == "reasoning":
             self._handle_reasoning_command(cmd_original)
         elif canonical == "fast":
@@ -6206,6 +6208,26 @@ class HermesCLI:
         else:
             os.environ["HERMES_YOLO_MODE"] = "1"
             self.console.print("  ⚡ YOLO mode [bold green]ON[/] — all commands auto-approved. Use with caution.")
+
+    def _toggle_local_mode(self):
+        """Toggle local inference mode — throttle concurrency for local LLM servers."""
+        import os
+        from agent.local_throttle import is_local_mode, reconfigure
+
+        if is_local_mode():
+            # Turn OFF: set env to "0" so auto-detect won't override the choice
+            os.environ["HERMES_LOCAL_MODE"] = "0"
+            reconfigure()
+            self.console.print(
+                "  [bold red]Local mode OFF[/] — full concurrency restored."
+            )
+        else:
+            # Turn ON: force local mode via env var
+            os.environ["HERMES_LOCAL_MODE"] = "1"
+            reconfigure()
+            self.console.print(
+                "  [bold green]Local mode ON[/] — throttled concurrency, higher timeouts, fewer retries."
+            )
 
     def _handle_reasoning_command(self, cmd: str):
         """Handle /reasoning — manage effort level and display toggle.

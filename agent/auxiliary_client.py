@@ -2094,23 +2094,35 @@ _DEFAULT_AUX_TIMEOUT = 30.0
 
 
 def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float:
-    """Read timeout from auxiliary.{task}.timeout in config, falling back to *default*."""
+    """Read timeout from auxiliary.{task}.timeout in config, falling back to *default*.
+
+    When local inference mode is active the returned value is multiplied by
+    the configured ``timeout_multiplier`` so that slow local models are not
+    killed prematurely.
+    """
     if not task:
-        return default
-    try:
-        from hermes_cli.config import load_config
-        config = load_config()
-    except ImportError:
-        return default
-    aux = config.get("auxiliary", {}) if isinstance(config, dict) else {}
-    task_config = aux.get(task, {}) if isinstance(aux, dict) else {}
-    raw = task_config.get("timeout")
-    if raw is not None:
+        raw_timeout = default
+    else:
+        raw_timeout = default
         try:
-            return float(raw)
-        except (ValueError, TypeError):
-            pass
-    return default
+            from hermes_cli.config import load_config
+            config = load_config()
+        except ImportError:
+            config = {}
+        aux = config.get("auxiliary", {}) if isinstance(config, dict) else {}
+        task_config = aux.get(task, {}) if isinstance(aux, dict) else {}
+        raw = task_config.get("timeout")
+        if raw is not None:
+            try:
+                raw_timeout = float(raw)
+            except (ValueError, TypeError):
+                pass
+    # Apply local-inference timeout multiplier (no-op for cloud APIs)
+    try:
+        from agent.local_throttle import get_timeout as _lt_get_timeout
+        return _lt_get_timeout(raw_timeout)
+    except Exception:
+        return raw_timeout
 
 
 # ---------------------------------------------------------------------------
@@ -2380,56 +2392,60 @@ def call_llm(
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     # Handle max_tokens vs max_completion_tokens retry, then payment fallback.
-    try:
-        return _validate_llm_response(
-            client.chat.completions.create(**kwargs), task)
-    except Exception as first_err:
-        err_str = str(first_err)
-        if "max_tokens" in err_str or "unsupported_parameter" in err_str:
-            kwargs.pop("max_tokens", None)
-            kwargs["max_completion_tokens"] = max_tokens
-            try:
-                return _validate_llm_response(
-                    client.chat.completions.create(**kwargs), task)
-            except Exception as retry_err:
-                # If the max_tokens retry also hits a payment or connection
-                # error, fall through to the fallback chain below.
-                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err)):
-                    raise
-                first_err = retry_err
+    # Acquire the local-inference throttle so auxiliary tasks don't pile up
+    # on slow local backends (no-op when using cloud APIs).
+    from agent.local_throttle import throttle as _lt_throttle
+    with _lt_throttle():
+        try:
+            return _validate_llm_response(
+                client.chat.completions.create(**kwargs), task)
+        except Exception as first_err:
+            err_str = str(first_err)
+            if "max_tokens" in err_str or "unsupported_parameter" in err_str:
+                kwargs.pop("max_tokens", None)
+                kwargs["max_completion_tokens"] = max_tokens
+                try:
+                    return _validate_llm_response(
+                        client.chat.completions.create(**kwargs), task)
+                except Exception as retry_err:
+                    # If the max_tokens retry also hits a payment or connection
+                    # error, fall through to the fallback chain below.
+                    if not (_is_payment_error(retry_err) or _is_connection_error(retry_err)):
+                        raise
+                    first_err = retry_err
 
-        # ── Payment / credit exhaustion fallback ──────────────────────
-        # When the resolved provider returns 402 or a credit-related error,
-        # try alternative providers instead of giving up.  This handles the
-        # common case where a user runs out of OpenRouter credits but has
-        # Codex OAuth or another provider available.
-        #
-        # ── Connection error fallback ────────────────────────────────
-        # When a provider endpoint is unreachable (DNS failure, connection
-        # refused, timeout), try alternative providers.  This handles stale
-        # Codex/OAuth tokens that authenticate but whose endpoint is down,
-        # and providers the user never configured that got picked up by
-        # the auto-detection chain.
-        should_fallback = _is_payment_error(first_err) or _is_connection_error(first_err)
-        # Only try alternative providers when the user didn't explicitly
-        # configure this task's provider.  Explicit provider = hard constraint;
-        # auto (the default) = best-effort fallback chain.  (#7559)
-        is_auto = resolved_provider in ("auto", "", None)
-        if should_fallback and is_auto:
-            reason = "payment error" if _is_payment_error(first_err) else "connection error"
-            logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
-                        task or "call", reason, resolved_provider, first_err)
-            fb_client, fb_model, fb_label = _try_payment_fallback(
-                resolved_provider, task, reason=reason)
-            if fb_client is not None:
-                fb_kwargs = _build_call_kwargs(
-                    fb_label, fb_model, messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, timeout=effective_timeout,
-                    extra_body=extra_body)
-                return _validate_llm_response(
-                    fb_client.chat.completions.create(**fb_kwargs), task)
-        raise
+            # ── Payment / credit exhaustion fallback ──────────────────────
+            # When the resolved provider returns 402 or a credit-related error,
+            # try alternative providers instead of giving up.  This handles the
+            # common case where a user runs out of OpenRouter credits but has
+            # Codex OAuth or another provider available.
+            #
+            # ── Connection error fallback ────────────────────────────────
+            # When a provider endpoint is unreachable (DNS failure, connection
+            # refused, timeout), try alternative providers.  This handles stale
+            # Codex/OAuth tokens that authenticate but whose endpoint is down,
+            # and providers the user never configured that got picked up by
+            # the auto-detection chain.
+            should_fallback = _is_payment_error(first_err) or _is_connection_error(first_err)
+            # Only try alternative providers when the user didn't explicitly
+            # configure this task's provider.  Explicit provider = hard constraint;
+            # auto (the default) = best-effort fallback chain.  (#7559)
+            is_auto = resolved_provider in ("auto", "", None)
+            if should_fallback and is_auto:
+                reason = "payment error" if _is_payment_error(first_err) else "connection error"
+                logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
+                            task or "call", reason, resolved_provider, first_err)
+                fb_client, fb_model, fb_label = _try_payment_fallback(
+                    resolved_provider, task, reason=reason)
+                if fb_client is not None:
+                    fb_kwargs = _build_call_kwargs(
+                        fb_label, fb_model, messages,
+                        temperature=temperature, max_tokens=max_tokens,
+                        tools=tools, timeout=effective_timeout,
+                        extra_body=extra_body)
+                    return _validate_llm_response(
+                        fb_client.chat.completions.create(**fb_kwargs), task)
+            raise
 
 
 def extract_content_or_reasoning(response) -> str:
@@ -2572,43 +2588,47 @@ async def async_call_llm(
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
-    try:
-        return _validate_llm_response(
-            await client.chat.completions.create(**kwargs), task)
-    except Exception as first_err:
-        err_str = str(first_err)
-        if "max_tokens" in err_str or "unsupported_parameter" in err_str:
-            kwargs.pop("max_tokens", None)
-            kwargs["max_completion_tokens"] = max_tokens
-            try:
-                return _validate_llm_response(
-                    await client.chat.completions.create(**kwargs), task)
-            except Exception as retry_err:
-                # If the max_tokens retry also hits a payment or connection
-                # error, fall through to the fallback chain below.
-                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err)):
-                    raise
-                first_err = retry_err
+    # Acquire the local-inference throttle (blocking acquire is intentional —
+    # we want to serialize requests to slow local backends).
+    from agent.local_throttle import throttle as _lt_throttle
+    with _lt_throttle():
+        try:
+            return _validate_llm_response(
+                await client.chat.completions.create(**kwargs), task)
+        except Exception as first_err:
+            err_str = str(first_err)
+            if "max_tokens" in err_str or "unsupported_parameter" in err_str:
+                kwargs.pop("max_tokens", None)
+                kwargs["max_completion_tokens"] = max_tokens
+                try:
+                    return _validate_llm_response(
+                        await client.chat.completions.create(**kwargs), task)
+                except Exception as retry_err:
+                    # If the max_tokens retry also hits a payment or connection
+                    # error, fall through to the fallback chain below.
+                    if not (_is_payment_error(retry_err) or _is_connection_error(retry_err)):
+                        raise
+                    first_err = retry_err
 
-        # ── Payment / connection fallback (mirrors sync call_llm) ─────
-        should_fallback = _is_payment_error(first_err) or _is_connection_error(first_err)
-        is_auto = resolved_provider in ("auto", "", None)
-        if should_fallback and is_auto:
-            reason = "payment error" if _is_payment_error(first_err) else "connection error"
-            logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
-                        task or "call", reason, resolved_provider, first_err)
-            fb_client, fb_model, fb_label = _try_payment_fallback(
-                resolved_provider, task, reason=reason)
-            if fb_client is not None:
-                fb_kwargs = _build_call_kwargs(
-                    fb_label, fb_model, messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, timeout=effective_timeout,
-                    extra_body=extra_body)
-                # Convert sync fallback client to async
-                async_fb, async_fb_model = _to_async_client(fb_client, fb_model or "")
-                if async_fb_model and async_fb_model != fb_kwargs.get("model"):
-                    fb_kwargs["model"] = async_fb_model
-                return _validate_llm_response(
-                    await async_fb.chat.completions.create(**fb_kwargs), task)
-        raise
+            # ── Payment / connection fallback (mirrors sync call_llm) ─────
+            should_fallback = _is_payment_error(first_err) or _is_connection_error(first_err)
+            is_auto = resolved_provider in ("auto", "", None)
+            if should_fallback and is_auto:
+                reason = "payment error" if _is_payment_error(first_err) else "connection error"
+                logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
+                            task or "call", reason, resolved_provider, first_err)
+                fb_client, fb_model, fb_label = _try_payment_fallback(
+                    resolved_provider, task, reason=reason)
+                if fb_client is not None:
+                    fb_kwargs = _build_call_kwargs(
+                        fb_label, fb_model, messages,
+                        temperature=temperature, max_tokens=max_tokens,
+                        tools=tools, timeout=effective_timeout,
+                        extra_body=extra_body)
+                    # Convert sync fallback client to async
+                    async_fb, async_fb_model = _to_async_client(fb_client, fb_model or "")
+                    if async_fb_model and async_fb_model != fb_kwargs.get("model"):
+                        fb_kwargs["model"] = async_fb_model
+                    return _validate_llm_response(
+                        await async_fb.chat.completions.create(**fb_kwargs), task)
+            raise

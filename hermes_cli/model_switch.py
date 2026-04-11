@@ -463,6 +463,29 @@ def switch_model(
     target_provider = current_provider
 
     # =================================================================
+    # Parse provider/model shorthand (e.g., "local-gemma/gemma-4-26b")
+    # =================================================================
+    if "/" in new_model and not explicit_provider:
+        # Split on first "/" to get provider_slug/model
+        parts = new_model.split("/", 1)
+        potential_provider = parts[0]
+        potential_model = parts[1]
+
+        # Check if this looks like a valid custom provider
+        if custom_providers:
+            for cp in custom_providers:
+                if cp.get("name", "").lower() == potential_provider.lower():
+                    # Found it — treat as explicit provider
+                    explicit_provider = cp.get("name", potential_provider)
+                    new_model = potential_model
+                    logger.debug(
+                        "Parsed '%s' as provider '%s', model '%s'",
+                        raw_input, explicit_provider, new_model,
+                    )
+                    break
+        # If not found in custom_providers, keep it as model name (for aggregators)
+
+    # =================================================================
     # PATH A: Explicit --provider given
     # =================================================================
     if explicit_provider:
