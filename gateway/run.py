@@ -4567,11 +4567,33 @@ class GatewayRunner:
         else:
             try:
                 from agent.model_metadata import get_model_context_length
+                _ctx_override = None
+                try:
+                    _effective_base = (result.base_url or current_base_url or "").rstrip("/")
+                    from hermes_cli.config import load_config as _ms_load_config
+                    _ms_cp_list = _ms_load_config().get("custom_providers")
+                    if isinstance(_ms_cp_list, list):
+                        for _ms_cp in _ms_cp_list:
+                            if not isinstance(_ms_cp, dict):
+                                continue
+                            if (_ms_cp.get("base_url") or "").rstrip("/") == _effective_base:
+                                _top = _ms_cp.get("context_length")
+                                if _top is not None:
+                                    _ctx_override = int(_top)
+                                _ms_models = _ms_cp.get("models", {})
+                                if isinstance(_ms_models, dict):
+                                    _ms_mcfg = _ms_models.get(result.new_model, {})
+                                    if isinstance(_ms_mcfg, dict) and _ms_mcfg.get("context_length") is not None:
+                                        _ctx_override = int(_ms_mcfg["context_length"])
+                                break
+                except Exception:
+                    pass
                 ctx = get_model_context_length(
                     result.new_model,
                     base_url=result.base_url or current_base_url,
                     api_key=result.api_key or current_api_key,
                     provider=result.target_provider,
+                    config_context_length=_ctx_override,
                 )
                 lines.append(f"Context: {ctx:,} tokens")
             except Exception:

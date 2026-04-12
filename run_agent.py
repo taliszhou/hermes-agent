@@ -1273,7 +1273,15 @@ class AIAgent:
         # Store for reuse in switch_model (so config override persists across model switches)
         self._config_context_length = _config_context_length
 
-        # Check custom_providers per-model context_length
+        # Check custom_providers for context_length override.
+        # Supports both top-level (provider-wide) and per-model overrides:
+        #   custom_providers:
+        #     - name: local-gemma
+        #       base_url: http://localhost:8000/v1
+        #       context_length: 256000          # top-level: applies to all models
+        #       models:
+        #         gemma-4-26b:
+        #           context_length: 131072      # per-model: takes precedence
         if _config_context_length is None:
             try:
                 from hermes_cli.config import get_compatible_custom_providers
@@ -1287,6 +1295,14 @@ class AIAgent:
                     continue
                 _cp_url = (_cp_entry.get("base_url") or "").rstrip("/")
                 if _cp_url and _cp_url == self.base_url.rstrip("/"):
+                    # Top-level context_length on the provider entry
+                    _cp_top_ctx = _cp_entry.get("context_length")
+                    if _cp_top_ctx is not None:
+                        try:
+                            _config_context_length = int(_cp_top_ctx)
+                        except (TypeError, ValueError):
+                            pass
+                    # Per-model override takes precedence
                     _cp_models = _cp_entry.get("models", {})
                     if isinstance(_cp_models, dict):
                         _cp_model_cfg = _cp_models.get(self.model, {})
@@ -1619,12 +1635,41 @@ class AIAgent:
         # ── Update context compressor ──
         if hasattr(self, "context_compressor") and self.context_compressor:
             from agent.model_metadata import get_model_context_length
+
+            # Check custom_providers for a per-model context_length override
+            _switch_ctx_override = None
+            try:
+                from hermes_cli.config import load_config as _sw_load_config
+                _sw_cfg = _sw_load_config()
+                _sw_cp_list = _sw_cfg.get("custom_providers")
+                if isinstance(_sw_cp_list, list):
+                    for _sw_cp in _sw_cp_list:
+                        if not isinstance(_sw_cp, dict):
+                            continue
+                        _sw_url = (_sw_cp.get("base_url") or "").rstrip("/")
+                        if _sw_url and _sw_url == self.base_url.rstrip("/"):
+                            # Top-level context_length on the provider entry
+                            _sw_top_ctx = _sw_cp.get("context_length")
+                            if _sw_top_ctx is not None:
+                                _switch_ctx_override = int(_sw_top_ctx)
+                            # Per-model override takes precedence
+                            _sw_models = _sw_cp.get("models", {})
+                            if isinstance(_sw_models, dict):
+                                _sw_mcfg = _sw_models.get(self.model, {})
+                                if isinstance(_sw_mcfg, dict):
+                                    _sw_m_ctx = _sw_mcfg.get("context_length")
+                                    if _sw_m_ctx is not None:
+                                        _switch_ctx_override = int(_sw_m_ctx)
+                            break
+            except Exception:
+                pass
+
             new_context_length = get_model_context_length(
                 self.model,
                 base_url=self.base_url,
                 api_key=self.api_key,
                 provider=self.provider,
-                config_context_length=getattr(self, "_config_context_length", None),
+                config_context_length=_switch_ctx_override or getattr(self, "_config_context_length", None),
             )
             self.context_compressor.update_model(
                 model=self.model,
