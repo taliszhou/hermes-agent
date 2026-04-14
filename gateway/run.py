@@ -5812,18 +5812,28 @@ class GatewayRunner:
             return "⚡ YOLO mode **ON** for this session — all commands auto-approved. Use with caution."
 
     async def _handle_local_command(self, event: MessageEvent) -> str:
-        """Handle /local — toggle local inference throttle for this session."""
+        """Handle /local — toggle local inference throttle. Persists to config.yaml."""
         import os
         from agent.local_throttle import is_local_mode, reconfigure
 
-        if is_local_mode():
-            os.environ["HERMES_LOCAL_MODE"] = "0"
-            reconfigure()
-            return "Local inference mode **OFF** — full concurrency restored."
+        new_enabled = not is_local_mode()
+
+        # Persist to config.yaml
+        try:
+            from hermes_cli.config import load_config, save_config
+            cfg = load_config()
+            cfg.setdefault("local_inference", {})["enabled"] = new_enabled
+            save_config(cfg)
+        except Exception:
+            pass
+
+        os.environ["HERMES_LOCAL_MODE"] = "1" if new_enabled else "0"
+        reconfigure()
+
+        if new_enabled:
+            return "Local inference mode **ON** — throttled concurrency, higher timeouts.\n_(saved to config)_"
         else:
-            os.environ["HERMES_LOCAL_MODE"] = "1"
-            reconfigure()
-            return "Local inference mode **ON** — throttled concurrency, higher timeouts."
+            return "Local inference mode **OFF** — full concurrency restored.\n_(saved to config)_"
 
     async def _handle_verbose_command(self, event: MessageEvent) -> str:
         """Handle /verbose command — cycle tool progress display mode.

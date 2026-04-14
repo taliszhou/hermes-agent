@@ -6233,23 +6233,35 @@ class HermesCLI:
             self.console.print("  ⚡ YOLO mode [bold green]ON[/] — all commands auto-approved. Use with caution.")
 
     def _toggle_local_mode(self):
-        """Toggle local inference mode — throttle concurrency for local LLM servers."""
+        """Toggle local inference mode — throttle concurrency for local LLM servers.
+        Persists the choice to config.yaml so it survives restarts."""
         import os
         from agent.local_throttle import is_local_mode, reconfigure
 
-        if is_local_mode():
-            # Turn OFF: set env to "0" so auto-detect won't override the choice
-            os.environ["HERMES_LOCAL_MODE"] = "0"
-            reconfigure()
-            self.console.print(
-                "  [bold red]Local mode OFF[/] — full concurrency restored."
-            )
-        else:
-            # Turn ON: force local mode via env var
-            os.environ["HERMES_LOCAL_MODE"] = "1"
-            reconfigure()
+        new_enabled = not is_local_mode()
+
+        # Persist to config.yaml
+        try:
+            from hermes_cli.config import load_config, save_config
+            cfg = load_config()
+            cfg.setdefault("local_inference", {})["enabled"] = new_enabled
+            save_config(cfg)
+        except Exception:
+            pass
+
+        # Apply immediately via env var + reconfigure
+        os.environ["HERMES_LOCAL_MODE"] = "1" if new_enabled else "0"
+        reconfigure()
+
+        if new_enabled:
             self.console.print(
                 "  [bold green]Local mode ON[/] — throttled concurrency, higher timeouts, fewer retries."
+                "\n  [dim](saved to config)[/]"
+            )
+        else:
+            self.console.print(
+                "  [bold red]Local mode OFF[/] — full concurrency restored."
+                "\n  [dim](saved to config)[/]"
             )
 
     def _handle_reasoning_command(self, cmd: str):
