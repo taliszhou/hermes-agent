@@ -366,7 +366,7 @@ async def _api_post(
         if not response.ok:
             raise RuntimeError(f"iLink POST {endpoint} HTTP {response.status}: {raw[:200]}")
         result = json.loads(raw)
-        if result.get("errcode") != 0:
+        if result.get("errcode", 0) != 0:
             raise RuntimeError(f"iLink POST {endpoint} errcode={result.get('errcode')}: {result.get('errmsg', raw[:200])}")
         return result
 
@@ -1237,7 +1237,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 break
             except Exception as exc:
                 consecutive_failures += 1
-                logger.error("[%s] poll error (%d/%d): %s", self.name, consecutive_failures, MAX_CONSECUTIVE_FAILURES, exc)
+                logger.warning("[%s] poll error (%d/%d): %s", self.name, consecutive_failures, MAX_CONSECUTIVE_FAILURES, exc)
                 await asyncio.sleep(BACKOFF_DELAY_SECONDS if consecutive_failures >= MAX_CONSECUTIVE_FAILURES else RETRY_DELAY_SECONDS)
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                     consecutive_failures = 0
