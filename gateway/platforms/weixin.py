@@ -54,6 +54,26 @@ except ImportError:  # pragma: no cover - dependency gate
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
+
+# ---------------------------------------------------------------------------
+# Module-level registry: lets send_message / cron delivery reuse the gateway's
+# long-lived aiohttp session instead of opening a new one per request.
+# Keyed by account_id.
+# ---------------------------------------------------------------------------
+_weixin_adapter_registry: Dict[str, "WeixinAdapter"] = {}
+
+
+def register_weixin_adapter(adapter: "WeixinAdapter") -> None:
+    account_id = str(adapter._account_id or "").strip()
+    if account_id:
+        _weixin_adapter_registry[account_id] = adapter
+        logger.debug("Registered weixin adapter for account_id=%s", account_id)
+
+
+def get_registered_weixin_adapter(account_id: str) -> Optional["WeixinAdapter"]:
+    return _weixin_adapter_registry.get(str(account_id).strip())
+
+
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -345,7 +365,10 @@ async def _api_post(
         raw = await response.text()
         if not response.ok:
             raise RuntimeError(f"iLink POST {endpoint} HTTP {response.status}: {raw[:200]}")
-        return json.loads(raw)
+        result = json.loads(raw)
+        if result.get("errcode") != 0:
+            raise RuntimeError(f"iLink POST {endpoint} errcode={result.get('errcode')}: {result.get('errmsg', raw[:200])}")
+        return result
 
 
 async def _api_get(
@@ -1780,6 +1803,50 @@ async def send_weixin_direct(
     if not account_id:
         return {"error": "Weixin account ID missing. Configure WEIXIN_ACCOUNT_ID or platforms.weixin.extra.account_id."}
 
+    # -----------------------------------------------------------------------
+    # Fast path: reuse the gateway's long-lived adapter + session if available.
+    # This avoids the -14 session timeout that happens when each send creates
+    # a brand-new aiohttp.ClientSession (the iLink server treats that as a new
+    # login and invalidates the previous session's context token).
+    # -----------------------------------------------------------------------
+    registered_adapter = get_registered_weixin_adapter(account_id)
+    if registered_adapter and registered_adapter._session and registered_adapter._token:
+        logger.debug("send_weixin_direct: reusing registered adapter session for %s", account_id)
+        token_store = registered_adapter._token_store
+        context_token = token_store.get(account_id, chat_id) if token_store else None
+
+        last_result: Optional[SendResult] = None
+        cleaned = registered_adapter.format_message(message)
+        if cleaned:
+            # Temporarily swap the token_store so send() reads from the right one.
+            original_store = registered_adapter._token_store
+            if token_store:
+                registered_adapter._token_store = token_store
+            try:
+                last_result = await registered_adapter.send(chat_id, cleaned)
+            finally:
+                registered_adapter._token_store = original_store
+            if not last_result.success:
+                return {"error": f"Weixin send failed: {last_result.error}"}
+
+        for media_path, _is_voice in media_files or []:
+            ext = Path(media_path).suffix.lower()
+            if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
+                last_result = await registered_adapter.send_image_file(chat_id, media_path)
+            else:
+                last_result = await registered_adapter.send_document(chat_id, media_path)
+            if not last_result.success:
+                return {"error": f"Weixin media send failed: {last_result.error}"}
+
+        return {
+            "success": True,
+            "platform": "weixin",
+            "chat_id": chat_id,
+            "message_id": last_result.message_id if last_result else None,
+            "context_token_used": bool(context_token),
+        }
+
+    # Fallback: create a temporary one-shot session (original behaviour).
     token_store = ContextTokenStore(str(get_hermes_home()))
     token_store.restore(account_id)
     context_token = token_store.get(account_id, chat_id)
