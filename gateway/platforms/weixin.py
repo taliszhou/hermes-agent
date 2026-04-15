@@ -1157,6 +1157,7 @@ class WeixinAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[%s] Token lock unavailable (non-fatal): %s", self.name, exc)
 
+        register_weixin_adapter(self)
         self._session = aiohttp.ClientSession(trust_env=True)
         self._token_store.restore(self._account_id)
         self._poll_task = asyncio.create_task(self._poll_loop(), name="weixin-poll")
@@ -1176,6 +1177,8 @@ class WeixinAdapter(BasePlatformAdapter):
         if self._session and not self._session.closed:
             await self._session.close()
         self._session = None
+        # Unregister so future send_message calls don't reference a stale adapter.
+        _weixin_adapter_registry.pop(str(self._account_id).strip(), None)
         self._release_platform_lock()
         self._mark_disconnected()
         logger.info("[%s] Disconnected", self.name)
