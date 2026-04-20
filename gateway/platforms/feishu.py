@@ -119,6 +119,8 @@ _MARKDOWN_HINT_RE = re.compile(
     re.MULTILINE,
 )
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
+_MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
@@ -430,21 +432,64 @@ def _coerce_required_int(value: Any, default: int, min_value: int = 0) -> int:
 
 
 def _build_markdown_post_payload(content: str) -> str:
+    rows = _build_markdown_post_rows(content)
     return json.dumps(
         {
             "zh_cn": {
-                "content": [
-                    [
-                        {
-                            "tag": "md",
-                            "text": content,
-                        }
-                    ]
-                ],
+                "content": rows,
             }
         },
         ensure_ascii=False,
     )
+
+
+def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
+    """Build Feishu post rows while isolating fenced code blocks.
+
+    Feishu's `md` renderer can swallow trailing content when a fenced code block
+    appears inside one large markdown element. Split the reply at real fence
+    lines so prose before/after the code block remains visible while code stays
+    in a dedicated row.
+    """
+    if not content:
+        return [[{"tag": "md", "text": ""}]]
+    if "```" not in content:
+        return [[{"tag": "md", "text": content}]]
+
+    rows: List[List[Dict[str, str]]] = []
+    current: List[str] = []
+    in_code_block = False
+
+    def _flush_current() -> None:
+        nonlocal current
+        if not current:
+            return
+        segment = "\n".join(current)
+        if segment.strip():
+            rows.append([{"tag": "md", "text": segment}])
+        current = []
+
+    for raw_line in content.splitlines():
+        stripped_line = raw_line.strip()
+        is_fence = bool(
+            _MARKDOWN_FENCE_CLOSE_RE.match(stripped_line)
+            if in_code_block
+            else _MARKDOWN_FENCE_OPEN_RE.match(stripped_line)
+        )
+
+        if is_fence:
+            if not in_code_block:
+                _flush_current()
+            current.append(raw_line)
+            in_code_block = not in_code_block
+            if not in_code_block:
+                _flush_current()
+            continue
+
+        current.append(raw_line)
+
+    _flush_current()
+    return rows or [[{"tag": "md", "text": content}]]
 
 
 def parse_feishu_post_payload(payload: Any) -> FeishuPostParseResult:
@@ -1073,6 +1118,13 @@ class FeishuAdapter(BasePlatformAdapter):
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
         self._card_action_tokens: Dict[str, float] = {}  # token → first_seen_time
+        # Inbound events that arrived before the adapter loop was ready
+        # (e.g. during startup/restart or network-flap reconnect). A single
+        # drainer thread replays them as soon as the loop becomes available.
+        self._pending_inbound_events: List[Any] = []
+        self._pending_inbound_lock = threading.Lock()
+        self._pending_drain_scheduled = False
+        self._pending_inbound_max_depth = 1000  # cap queue; drop oldest beyond
         self._chat_locks: Dict[str, asyncio.Lock] = {}  # chat_id → lock (per-chat serial processing)
         self._sent_message_ids_to_chat: Dict[str, str] = {}  # message_id → chat_id (for reaction routing)
         self._sent_message_id_order: List[str] = []  # LRU order for _sent_message_ids_to_chat
@@ -1219,6 +1271,12 @@ class FeishuAdapter(BasePlatformAdapter):
             .register_p2_card_action_trigger(self._on_card_action_trigger)
             .register_p2_im_chat_member_bot_added_v1(self._on_bot_added_to_chat)
             .register_p2_im_chat_member_bot_deleted_v1(self._on_bot_removed_from_chat)
+            .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(self._on_p2p_chat_entered)
+            .register_p2_im_message_recalled_v1(self._on_message_recalled)
+            .register_p2_customized_event(
+                "drive.notice.comment_add_v1",
+                self._on_drive_comment_event,
+            )
             .build()
         )
 
@@ -1757,16 +1815,146 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _on_message_event(self, data: Any) -> None:
-        """Normalize Feishu inbound events into MessageEvent."""
+        """Normalize Feishu inbound events into MessageEvent.
+
+        Called by the lark_oapi SDK's event dispatcher on a background thread.
+        If the adapter loop is not currently accepting callbacks (brief window
+        during startup/restart or network-flap reconnect), the event is queued
+        for replay instead of dropped.
+        """
         loop = self._loop
-        if loop is None or bool(getattr(loop, "is_closed", lambda: False)()):
-            logger.warning("[Feishu] Dropping inbound message before adapter loop is ready")
+        if not self._loop_accepts_callbacks(loop):
+            start_drainer = self._enqueue_pending_inbound_event(data)
+            if start_drainer:
+                threading.Thread(
+                    target=self._drain_pending_inbound_events,
+                    name="feishu-pending-inbound-drainer",
+                    daemon=True,
+                ).start()
             return
         future = asyncio.run_coroutine_threadsafe(
             self._handle_message_event_data(data),
             loop,
         )
         future.add_done_callback(self._log_background_failure)
+
+    def _enqueue_pending_inbound_event(self, data: Any) -> bool:
+        """Append an event to the pending-inbound queue.
+
+        Returns True if the caller should spawn a drainer thread (no drainer
+        currently scheduled), False if a drainer is already running and will
+        pick up the new event on its next pass.
+        """
+        with self._pending_inbound_lock:
+            if len(self._pending_inbound_events) >= self._pending_inbound_max_depth:
+                # Queue full — drop the oldest to make room. This happens only
+                # if the loop stays unavailable for an extended period AND the
+                # WS keeps firing callbacks. Still better than silent drops.
+                dropped = self._pending_inbound_events.pop(0)
+                try:
+                    event = getattr(dropped, "event", None)
+                    message = getattr(event, "message", None)
+                    message_id = str(getattr(message, "message_id", "") or "unknown")
+                except Exception:
+                    message_id = "unknown"
+                logger.error(
+                    "[Feishu] Pending-inbound queue full (%d); dropped oldest event %s",
+                    self._pending_inbound_max_depth,
+                    message_id,
+                )
+            self._pending_inbound_events.append(data)
+            depth = len(self._pending_inbound_events)
+            should_start = not self._pending_drain_scheduled
+            if should_start:
+                self._pending_drain_scheduled = True
+        logger.warning(
+            "[Feishu] Queued inbound event for replay (loop not ready, queue depth=%d)",
+            depth,
+        )
+        return should_start
+
+    def _drain_pending_inbound_events(self) -> None:
+        """Replay queued inbound events once the adapter loop is ready.
+
+        Runs in a dedicated daemon thread. Polls ``_running`` and
+        ``_loop_accepts_callbacks`` until events can be dispatched or the
+        adapter shuts down. A single drainer handles the entire queue;
+        concurrent ``_on_message_event`` calls just append.
+        """
+        poll_interval = 0.25
+        max_wait_seconds = 120.0  # safety cap: drop queue after 2 minutes
+        waited = 0.0
+        try:
+            while True:
+                if not getattr(self, "_running", True):
+                    # Adapter shutting down — drop queued events rather than
+                    # holding them against a closed loop.
+                    with self._pending_inbound_lock:
+                        dropped = len(self._pending_inbound_events)
+                        self._pending_inbound_events.clear()
+                    if dropped:
+                        logger.warning(
+                            "[Feishu] Dropped %d queued inbound event(s) during shutdown",
+                            dropped,
+                        )
+                    return
+                loop = self._loop
+                if self._loop_accepts_callbacks(loop):
+                    with self._pending_inbound_lock:
+                        batch = self._pending_inbound_events[:]
+                        self._pending_inbound_events.clear()
+                    if not batch:
+                        # Queue emptied between check and grab; done.
+                        with self._pending_inbound_lock:
+                            if not self._pending_inbound_events:
+                                return
+                        continue
+                    dispatched = 0
+                    requeue: List[Any] = []
+                    for event in batch:
+                        try:
+                            fut = asyncio.run_coroutine_threadsafe(
+                                self._handle_message_event_data(event),
+                                loop,
+                            )
+                            fut.add_done_callback(self._log_background_failure)
+                            dispatched += 1
+                        except RuntimeError:
+                            # Loop closed between check and submit — requeue
+                            # and poll again.
+                            requeue.append(event)
+                    if requeue:
+                        with self._pending_inbound_lock:
+                            self._pending_inbound_events[:0] = requeue
+                    if dispatched:
+                        logger.info(
+                            "[Feishu] Replayed %d queued inbound event(s)",
+                            dispatched,
+                        )
+                    if not requeue:
+                        # Successfully drained; check if more arrived while
+                        # we were dispatching and exit if not.
+                        with self._pending_inbound_lock:
+                            if not self._pending_inbound_events:
+                                return
+                    # More events queued or requeue pending — loop again.
+                    continue
+                if waited >= max_wait_seconds:
+                    with self._pending_inbound_lock:
+                        dropped = len(self._pending_inbound_events)
+                        self._pending_inbound_events.clear()
+                    logger.error(
+                        "[Feishu] Adapter loop unavailable for %.0fs; "
+                        "dropped %d queued inbound event(s)",
+                        max_wait_seconds,
+                        dropped,
+                    )
+                    return
+                time.sleep(poll_interval)
+                waited += poll_interval
+        finally:
+            with self._pending_inbound_lock:
+                self._pending_drain_scheduled = False
 
     async def _handle_message_event_data(self, data: Any) -> None:
         """Shared inbound message handling for websocket and webhook transports."""
@@ -1782,8 +1970,8 @@ class FeishuAdapter(BasePlatformAdapter):
         if not message_id or self._is_duplicate(message_id):
             logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
             return
-        if getattr(sender, "sender_type", "") == "bot":
-            logger.debug("[Feishu] Dropping bot-originated event: %s", message_id)
+        if self._is_self_sent_bot_message(event):
+            logger.debug("[Feishu] Dropping self-sent bot event: %s", message_id)
             return
 
         chat_type = getattr(message, "chat_type", "p2p")
@@ -1819,6 +2007,31 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_id = str(getattr(event, "chat_id", "") or "")
         logger.info("[Feishu] Bot removed from chat: %s", chat_id)
         self._chat_info_cache.pop(chat_id, None)
+
+    def _on_p2p_chat_entered(self, data: Any) -> None:
+        logger.debug("[Feishu] User entered P2P chat with bot")
+
+    def _on_message_recalled(self, data: Any) -> None:
+        logger.debug("[Feishu] Message recalled by user")
+
+    def _on_drive_comment_event(self, data: Any) -> None:
+        """Handle drive document comment notification (drive.notice.comment_add_v1).
+
+        Delegates to :mod:`gateway.platforms.feishu_comment` for parsing,
+        logging, and reaction.  Scheduling follows the same
+        ``run_coroutine_threadsafe`` pattern used by ``_on_message_event``.
+        """
+        from gateway.platforms.feishu_comment import handle_drive_comment_event
+
+        loop = self._loop
+        if not self._loop_accepts_callbacks(loop):
+            logger.warning("[Feishu] Dropping drive comment event before adapter loop is ready")
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            handle_drive_comment_event(self._client, data, self_open_id=self._bot_open_id),
+            loop,
+        )
+        future.add_done_callback(self._log_background_failure)
 
     def _on_reaction_event(self, event_type: str, data: Any) -> None:
         """Route user reactions on bot messages as synthetic text events."""
@@ -2445,6 +2658,8 @@ class FeishuAdapter(BasePlatformAdapter):
             self._on_reaction_event(event_type, data)
         elif event_type == "card.action.trigger":
             self._on_card_action_trigger(data)
+        elif event_type == "drive.notice.comment_add_v1":
+            self._on_drive_comment_event(data)
         else:
             logger.debug("[Feishu] Ignoring webhook event type: %s", event_type or "unknown")
         return web.json_response({"code": 0, "msg": "ok"})
@@ -3079,6 +3294,23 @@ class FeishuAdapter(BasePlatformAdapter):
             return self._post_mentions_bot(normalized.mentioned_ids)
         return False
 
+    def _is_self_sent_bot_message(self, event: Any) -> bool:
+        """Return True only for Feishu events emitted by this Hermes bot."""
+        sender = getattr(event, "sender", None)
+        sender_type = str(getattr(sender, "sender_type", "") or "").strip().lower()
+        if sender_type not in {"bot", "app"}:
+            return False
+
+        sender_id = getattr(sender, "sender_id", None)
+        sender_open_id = str(getattr(sender_id, "open_id", "") or "").strip()
+        sender_user_id = str(getattr(sender_id, "user_id", "") or "").strip()
+
+        if self._bot_open_id and sender_open_id == self._bot_open_id:
+            return True
+        if self._bot_user_id and sender_user_id == self._bot_user_id:
+            return True
+        return False
+
     def _message_mentions_bot(self, mentions: List[Any]) -> bool:
         """Check whether any mention targets the configured or inferred bot identity."""
         for mention in mentions:
@@ -3106,10 +3338,55 @@ class FeishuAdapter(BasePlatformAdapter):
         return False
 
     async def _hydrate_bot_identity(self) -> None:
-        """Best-effort discovery of bot identity for precise group mention gating."""
+        """Best-effort discovery of bot identity for precise group mention gating
+        and self-sent bot event filtering.
+
+        Populates ``_bot_open_id`` and ``_bot_name`` from /open-apis/bot/v3/info
+        (no extra scopes required beyond the tenant access token). Falls back to
+        the application info endpoint for ``_bot_name`` only when the first probe
+        doesn't return it. Each field is hydrated independently — a value already
+        supplied via env vars (FEISHU_BOT_OPEN_ID / FEISHU_BOT_USER_ID /
+        FEISHU_BOT_NAME) is preserved and skips its probe.
+        """
         if not self._client:
             return
-        if any((self._bot_open_id, self._bot_user_id, self._bot_name)):
+        if self._bot_open_id and self._bot_name:
+            # Everything the self-send filter and precise mention gate need is
+            # already in place; nothing to probe.
+            return
+
+        # Primary probe: /open-apis/bot/v3/info — returns bot_name + open_id, no
+        # extra scopes required. This is the same endpoint the onboarding wizard
+        # uses via probe_bot().
+        if not self._bot_open_id or not self._bot_name:
+            try:
+                resp = await asyncio.to_thread(
+                    self._client.request,
+                    method="GET",
+                    url="/open-apis/bot/v3/info",
+                    body=None,
+                    raw_response=True,
+                )
+                content = getattr(resp, "content", None)
+                if content:
+                    payload = json.loads(content)
+                    parsed = _parse_bot_response(payload) or {}
+                    open_id = (parsed.get("bot_open_id") or "").strip()
+                    bot_name = (parsed.get("bot_name") or "").strip()
+                    if open_id and not self._bot_open_id:
+                        self._bot_open_id = open_id
+                    if bot_name and not self._bot_name:
+                        self._bot_name = bot_name
+            except Exception:
+                logger.debug(
+                    "[Feishu] /bot/v3/info probe failed during hydration",
+                    exc_info=True,
+                )
+
+        # Fallback probe for _bot_name only: application info endpoint. Needs
+        # admin:app.info:readonly or application:application:self_manage scope,
+        # so it's best-effort.
+        if self._bot_name:
             return
         try:
             request = self._build_get_application_request(app_id=self._app_id, lang="en_us")
@@ -3118,17 +3395,17 @@ class FeishuAdapter(BasePlatformAdapter):
                 code = getattr(response, "code", None)
                 if code == 99991672:
                     logger.warning(
-                        "[Feishu] Unable to hydrate bot identity from application info. "
+                        "[Feishu] Unable to hydrate bot name from application info. "
                         "Grant admin:app.info:readonly or application:application:self_manage "
                         "so group @mention gating can resolve the bot name precisely."
                     )
                 return
             app = getattr(getattr(response, "data", None), "app", None)
             app_name = (getattr(app, "app_name", None) or "").strip()
-            if app_name:
+            if app_name and not self._bot_name:
                 self._bot_name = app_name
         except Exception:
-            logger.debug("[Feishu] Failed to hydrate bot identity", exc_info=True)
+            logger.debug("[Feishu] Failed to hydrate bot name from application info", exc_info=True)
 
     # =========================================================================
     # Deduplication — seen message ID cache (persistent)
